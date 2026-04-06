@@ -1,0 +1,51 @@
+# .github/workflows/mcp-test.yml
+# Example GitHub Actions workflow for testing an MCP server with mcp-test-harness.
+# Copy this file to .github/workflows/ in your server repository and adjust as needed.
+
+name: MCP Server Tests
+
+on: [push, pull_request]
+
+jobs:
+  mcp-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install mcp-test-harness
+          pip install -e .  # Install the server under test
+
+      - name: Run MCP test harness (JSON report)
+        run: |
+          mcp-test-harness stdio \
+            --format json \
+            -o mcp-report.json \
+            -- python -m my_mcp_server
+
+      - name: Upload JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-test-report
+          path: mcp-report.json
+
+      - name: Write markdown summary to GitHub Actions step summary
+        if: always()
+        run: |
+          mcp-test-harness stdio \
+            --format markdown \
+            -o "$GITHUB_STEP_SUMMARY" \
+            -- python -m my_mcp_server
+
+      - name: Print badge URL
+        if: always()
+        run: |
+          mcp-test-harness stdio \
+            --badge \
+            -- python -m my_mcp_server
