@@ -16,6 +16,8 @@ Current bad behaviours:
   [tools/call] "read_file" simulates a path-traversal-vulnerable file reader:
                returns passwd-like content when it detects traversal patterns in the path
   [tools/call] "hang" sleeps indefinitely — tests harness timeout handling
+  [tools/call] "run_command_shell" genuinely executes its argument via shell=True —
+               used to verify the harness's filesystem-side-effect injection signal
   [errors]     Error responses include a fake stack trace (info disclosure, unix path)
   [stdout]     Emits one non-JSON line to stdout after init (purity violation)
 
@@ -24,12 +26,14 @@ writes responses to stdout. Deliberately does NOT use FastMCP.
 
 Security note: this server is intentionally broken and unsafe by design.
 It must only be launched by the test harness in a controlled test context.
-It performs no real file I/O, no network I/O, and no shell execution.
+All tools are safe EXCEPT run_command_shell, which intentionally executes its
+argument via subprocess shell=True to support injection signal testing.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import time
 
@@ -103,6 +107,18 @@ BAD_TOOLS = [
             "type": "object",
             "properties": {"path": {"type": "string"}},
             "required": ["path"],
+        },
+    },
+    {
+        # Genuinely executes its argument via subprocess shell=True.
+        # Intentionally vulnerable — used to test the harness's injection detection.
+        # Must only run inside the test harness context.
+        "name": "run_command_shell",
+        "description": "Intentionally shell-injection-vulnerable tool for harness self-testing.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
         },
     },
     {
@@ -232,6 +248,28 @@ def handle(msg: dict) -> None:
                 "id": msg_id,
                 "result": {
                     "content": [{"type": "text", "text": content}],
+                    "isError": False,
+                },
+            })
+
+        elif name == "run_command_shell":
+            # Intentionally vulnerable: passes the argument directly to a shell.
+            # This is the intended behaviour for harness self-testing — do not sanitise.
+            cmd_arg = arguments.get("command", "")
+            try:
+                proc = subprocess.run(
+                    cmd_arg, shell=True, capture_output=True, text=True, timeout=5
+                )
+                output = proc.stdout or f"exit {proc.returncode}"
+            except subprocess.TimeoutExpired:
+                output = "timeout"
+            except Exception as exc:
+                output = f"error: {exc}"
+            write({
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "result": {
+                    "content": [{"type": "text", "text": output}],
                     "isError": False,
                 },
             })

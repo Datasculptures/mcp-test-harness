@@ -1,18 +1,23 @@
 """
 Shell injection probe suite.
 
-Sends shell metacharacter payloads as tool arguments and detects whether
-the server executed a shell command or safely echoed/rejected the input.
-Also probes for environment variable expansion in tool arguments.
+Sends shell metacharacter payloads as tool arguments and checks for
+filesystem side-effects to detect genuine shell execution.
 
-Uses the HARNESS_CANARY_7f3a9b string to distinguish execution from echo:
-  - Canary returned WITH metachar prefix → safe echo, pass
-  - Canary returned WITHOUT metachar prefix → shell likely executed it, fail
-  - Server rejected the input → pass
-  - Ambiguous → warn
+Detection signal — filesystem side-effect (Option A):
+  Each payload, if passed through a shell (e.g. subprocess(..., shell=True)),
+  creates a unique marker file in a harness-controlled scratch directory.
+  After the tool call, the harness checks whether the file was created:
+    - File exists  → shell command was executed → FAIL
+    - No file      → no shell execution (tokenizer, echo, rejection) → PASS
+
+  This approach has zero false positives against tokenizer-backed tools
+  (ChromaDB, SQLite FTS5, Meilisearch, etc.) because tokenizers cannot
+  create files. It also avoids false positives against tools that echo,
+  store, or normalize the input string.
 
 Env var probes check whether the server expands variables like ${HOME}
-instead of treating them as opaque strings.
+instead of treating them as opaque strings (separate detection logic).
 
 All tests use the raw client and run within a single server process.
 Payloads are hardcoded constants — never derived from external input.
@@ -22,24 +27,55 @@ No shell=True, no eval, no subprocess in this module.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import shutil
+import tempfile
 import time
+from pathlib import Path
 
 from mcp_test_harness.client.stdio_raw import ReadTimeout, StdioRawClient
 from mcp_test_harness.config import ServerConfig
 from mcp_test_harness.suites.base import BaseSuite, TestResult
 
-# Canary must be unique enough that it cannot appear in normal server output.
-CANARY = "HARNESS_CANARY_7f3a9b"
+def _make_canary_payloads(canary_dir: Path) -> list[tuple[str, str, Path]]:
+    """
+    Build shell metacharacter payloads that create a unique marker file if
+    the argument is ever passed to a shell.
 
-# (payload_string, short_name, metachar_prefix_that_must_survive_safe_echo)
-INJECTION_PAYLOADS: list[tuple[str, str, str]] = [
-    ("; echo " + CANARY,        "semicolon",     ";"),
-    ("| echo " + CANARY,        "pipe",          "|"),
-    ("`echo " + CANARY + "`",   "backtick",      "`"),
-    ("$(echo " + CANARY + ")",  "dollar_paren",  "$("),
-    ("&& echo " + CANARY,       "ampersand",     "&&"),
-]
+    Returns list of (payload_string, short_name, canary_file).
+
+    Platform branching:
+      Unix  — uses 'touch "<path>"'  (works in sh/bash)
+      Windows — uses 'echo.>"<path>"'  (works in cmd.exe)
+
+    On Windows, cmd.exe does not treat ';', backtick, or '$()' as separators,
+    so those variants will not create files even against a genuinely vulnerable
+    cmd.exe-based server. They are still included because they produce zero false
+    positives against tokenizer-backed tools (no file creation either way), and
+    some Windows servers may use bash or PowerShell instead of cmd.exe.
+    """
+    if os.name == "nt":
+        def _create_cmd(p: Path) -> str:
+            return f'echo.>"{p}"'
+    else:
+        def _create_cmd(p: Path) -> str:
+            return f'touch "{p}"'
+
+    variants = [
+        ("semicolon",    "hello; {cmd}"),
+        ("pipe",         "hello| {cmd}"),
+        ("backtick",     "hello`{cmd}`"),
+        ("dollar_paren", "hello$({cmd})"),
+        ("ampersand",    "hello && {cmd}"),
+    ]
+    result: list[tuple[str, str, Path]] = []
+    for short_name, template in variants:
+        canary_file = canary_dir / f"canary_{short_name}.marker"
+        payload = template.format(cmd=_create_cmd(canary_file))
+        result.append((payload, short_name, canary_file))
+    return result
+
 
 # (payload_string, short_name)
 # These payloads test whether the server expands env vars instead of
@@ -62,7 +98,7 @@ class InjectionSuite(BaseSuite):
 
     async def run(self, config: ServerConfig) -> list[TestResult]:
         results: list[TestResult] = []
-        t0_total = time.monotonic()
+        canary_dir = Path(tempfile.mkdtemp(prefix="mcp_harness_canary_"))
         try:
             async with StdioRawClient(
                 config.command, env=config.env, timeout=config.timeout
@@ -79,12 +115,14 @@ class InjectionSuite(BaseSuite):
                     )
                     return results
 
-                for payload, payload_name, metachar in INJECTION_PAYLOADS:
+                canary_payloads = _make_canary_payloads(canary_dir)
+
+                for payload, payload_name, canary_file in canary_payloads:
                     for tool_info in string_tools:
                         test_name = f"shell_metachar_{payload_name}__{tool_info['name']}"
                         t0 = time.monotonic()
                         result = await self._run_one(
-                            client, config, test_name, tool_info, payload, metachar
+                            client, config, test_name, tool_info, payload, canary_file
                         )
                         result.duration_ms = (time.monotonic() - t0) * 1000
                         results.append(result)
@@ -107,6 +145,8 @@ class InjectionSuite(BaseSuite):
             results.append(
                 self._error("injection_probing", f"Suite-level error: {exc}")
             )
+        finally:
+            shutil.rmtree(canary_dir, ignore_errors=True)
 
         return results
 
@@ -164,11 +204,11 @@ class InjectionSuite(BaseSuite):
         test_name: str,
         tool_info: dict,
         payload: str,
-        metachar: str,
+        canary_file: Path,
     ) -> TestResult:
         arguments = _build_args(tool_info, payload)
         try:
-            response = await client.send_request(
+            await client.send_request(
                 "tools/call",
                 params={"name": tool_info["name"], "arguments": arguments},
             )
@@ -180,19 +220,15 @@ class InjectionSuite(BaseSuite):
         except asyncio.CancelledError:
             return self._error(test_name, "test cancelled")
 
-        status = _detect_injection(payload, metachar, response)
-        if status == "pass":
-            return self._pass(test_name)
-        if status == "fail":
+        # Filesystem side-effect check: if the server passed the argument to a shell,
+        # the shell created the canary file. Tokenizers, echo tools, and rejection
+        # paths cannot create files, so this signal has no false positives against them.
+        if canary_file.exists():
             return self._fail(
                 test_name,
-                f"canary detected without metachar prefix '{metachar}' — "
-                "possible shell command execution",
+                f"shell command executed — canary file created ({canary_file.name})",
             )
-        if status == "warn":
-            return self._warn(test_name, "ambiguous canary detection in response")
-        # status == "error" (shouldn't happen, but be safe)
-        return self._error(test_name, "unexpected detection result")
+        return self._pass(test_name)
 
     async def _run_env_probe(
         self,
@@ -261,48 +297,6 @@ def _build_args(tool_info: dict, payload_value: str) -> dict:
                 args[name] = "test"
     return args
 
-
-def _detect_injection(payload: str, metachar_prefix: str, response: dict) -> str:
-    """
-    Analyse a tool response for injection indicators.
-
-    Returns one of: "pass", "fail", "warn", "error"
-
-    Decision tree:
-      1. Server returned JSON-RPC error or isError:true → pass (input rejected)
-      2. Canary not in response text at all → pass (not echoed, not executed)
-      3. Full payload (including metachar) echoed back → pass (safe string echo)
-      4. Canary present but metachar prefix absent → fail (shell stripped it)
-      5. Canary present and metachar also present (ambiguous position) → warn
-    """
-    # Case 1: input was rejected
-    if "error" in response:
-        return "pass"
-    result = response.get("result", {})
-    if result.get("isError"):
-        return "pass"
-
-    # Extract all text content
-    content_texts: list[str] = []
-    for item in result.get("content", []):
-        if isinstance(item, dict) and item.get("type") == "text":
-            content_texts.append(item.get("text", ""))
-    full_text = "\n".join(content_texts)
-
-    # Case 2: canary not present at all
-    if CANARY not in full_text:
-        return "pass"
-
-    # Case 3: full payload (with metachar) echoed safely
-    if payload in full_text:
-        return "pass"
-
-    # Case 4: canary present but metachar prefix is gone → likely executed
-    if metachar_prefix not in full_text:
-        return "fail"
-
-    # Case 5: canary and metachar both present but payload string not exact
-    return "warn"
 
 
 def _detect_env_expansion(payload: str, response: dict) -> str:
